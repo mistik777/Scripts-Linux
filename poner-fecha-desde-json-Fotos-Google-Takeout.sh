@@ -8,14 +8,14 @@ command -v jq >/dev/null 2>&1 || { echo "Falta jq. Instala: sudo apt-get install
 
 fixed=0; skipped=0; invalid=0
 
-# Foto + vídeo conocidos (para emparejar por 'stem' si el JSON no trae la extensión)
-EXTS="jpg jpeg png heic heif gif bmp tif tiff dng arw nef cr2 raf cr3
-      mp4 mov 3gp avi m4v mkv webm mts m2ts"
+# Extensiones conocidas (para emparejar por stem si el JSON no trae la extensión)
+EXTS=(jpg jpeg png heic heif gif bmp tif tiff dng arw nef cr2 raf cr3 mp4 mov 3gp avi m4v mkv webm mts m2ts)
+# Hermanos a los que copiar la fecha si comparten el mismo stem
+SIB_EXTS=(mp4 mov 3gp m4v)
 
 normalize_ts() {
   local ts="$1"
   ts="${ts%\"}"; ts="${ts#\"}"
-  # si viene con milisegundos o punto, quédate con 10 dígitos
   if [[ "$ts" =~ ^[0-9]{13,}$ ]]; then
     echo "${ts:0:10}"
   elif [[ "$ts" =~ ^[0-9]{10}$ ]]; then
@@ -25,21 +25,20 @@ normalize_ts() {
   fi
 }
 
-find_local_one() { # dir pattern (iname)
+find_local_one() { # dir, pattern (iname)
   find "$1" -maxdepth 1 -type f ! -iname "*.json" -iname "$2" -print -quit 2>/dev/null || true
 }
-find_global_one() { # root pattern (iname)
+find_global_one() { # root, pattern (iname)
   find "$1" -type f ! -iname "*.json" -iname "$2" -print -quit 2>/dev/null || true
 }
 
-# Recorre recursivamente todos los JSON (también *.supplemental-metadata.json)
 find "$SRC" -type f -iname "*.json" -print0 | while IFS= read -r -d '' json; do
-  # JSON vacío o inválido → saltar
+  # JSON inválido/vacío
   if [[ ! -s "$json" ]] || ! jq -e 'true' "$json" >/dev/null 2>&1; then
     echo "JSON inválido/vacío: $json"; ((invalid++)) || true; continue
   fi
 
-  # Timestamp (varios campos posibles)
+  # Timestamp
   raw_ts="$(jq -r '(.photoTakenTime.timestamp // .creationTime.timestamp // .takenTime.timestamp // .modificationTime.timestamp // .timestamp // empty)' "$json")"
   ts="$(normalize_ts "$raw_ts")"
   if [[ -z "$ts" ]]; then
@@ -51,30 +50,37 @@ find "$SRC" -type f -iname "*.json" -print0 | while IFS= read -r -d '' json; do
 
   target=""
 
-  # 1) Emparejar por 'title' en el MISMO directorio (exacto/CI)
+  # 1) Por 'title' (local → global)
   if [[ -n "$title" && "$title" != "null" ]]; then
-    [[ -f "$dir/$title" ]] && target="$dir/$title"
-    [[ -z "$target" ]] && target="$(find_local_one "$dir" "$title")"
-    # Si no está, buscar en TODO el árbol
-    [[ -z "$target" ]] && target="$(find_global_one "$SRC" "$title")"
+    if [[ -f "$dir/$title" ]]; then
+      target="$dir/$title"
+    else
+      cand="$(find_local_one "$dir" "$title")"
+      [[ -z "$cand" ]] && cand="$(find_global_one "$SRC" "$title")"
+      [[ -n "$cand" ]] && target="$cand"
+    fi
   fi
 
-  # 2) Emparejar por nombre del JSON (quitando sufijos) en local y global
+  # 2) Por nombre del JSON (quitando sufijos) y por stem+ext
   if [[ -z "$target" ]]; then
     base="$(basename -- "$json")"
     base="${base%.json}"
     base="${base%.supplemental-metadata}"
-    [[ -f "$dir/$base" ]] && target="$dir/$base"
-    [[ -z "$target" ]] && target="$(find_local_one "$dir" "$base")"
-    [[ -z "$target" ]] && target="$(find_global_one "$SRC" "$base")"
-    # 2b) Probar por 'stem' + extensiones conocidas
-    if [[ -z "$target" ]]; then
-      stem="${base%.*}"
-      for e in $EXTS; do
-        cand="$(find_local_one "$dir" "${stem}.${e}")"
-        [[ -z "$cand" ]] && cand="$(find_global_one "$SRC" "${stem}.${e}")"
-        if [[ -n "$cand" ]]; then target="$cand"; break; fi
-      done
+    if [[ -f "$dir/$base" ]]; then
+      target="$dir/$base"
+    else
+      cand="$(find_local_one "$dir" "$base")"
+      [[ -z "$cand" ]] && cand="$(find_global_one "$SRC" "$base")"
+      if [[ -z "$cand" ]]; then
+        stem="${base%.*}"
+        for e in "${EXTS[@]}"; do
+          cand="$(find_local_one "$dir" "${stem}.${e}")"
+          [[ -z "$cand" ]] && cand="$(find_global_one "$SRC" "${stem}.${e}")"
+          if [[ -n "$cand" ]]; then target="$cand"; break; fi
+        done
+      else
+        target="$cand"
+      fi
     fi
   fi
 
@@ -83,8 +89,25 @@ find "$SRC" -type f -iname "*.json" -print0 | while IFS= read -r -d '' json; do
   fi
 
   touch -d "@$ts" -- "$target"
-  printf 'OK  %-50s  %s\n' "$(realpath --relative-to="$SRC" "$target")" "$(date -d "@$ts" '+%F %T')"
+  rel_target="$(realpath --relative-to="$SRC" "$target" 2>/dev/null || echo "$target")"
+  ts_fmt="$(date -d "@$ts" '+%F %T')"
+  printf 'OK   %-60s  %s\n' "$rel_target" "$ts_fmt"
   ((fixed++)) || true
+
+  # Copiar fecha a hermanos (mismo stem) si NO tienen su propio JSON
+  stem_name="$(basename -- "$target")"; stem_name="${stem_name%.*}"
+  for e in "${SIB_EXTS[@]}"; do
+    sib="$(find "$dir" -maxdepth 1 -type f -iname "${stem_name}.${e}" -print -quit 2>/dev/null || true)"
+    [[ -z "$sib" ]] && continue
+    [[ "$sib" -ef "$target" ]] && continue
+    sib_base="$(basename -- "$sib")"
+    if [[ -f "$dir/$sib_base.json" || -f "$dir/$sib_base.supplemental-metadata.json" ]]; then
+      continue
+    fi
+    touch -d "@$ts" -- "$sib"
+    rel_sib="$(realpath --relative-to="$SRC" "$sib" 2>/dev/null || echo "$sib")"
+    printf 'PAIR %-60s  %s\n' "$rel_sib" "$ts_fmt"
+  done
 done
 
 echo "-------------------------------------"
